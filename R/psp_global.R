@@ -112,7 +112,7 @@ psp_global <- function(fn, control = psp_control(), ..., quiet = FALSE) {
         msg = paste("This function is no longer maintained and is scheduled for removal.\nPlease use pspGlobal instead.")
     )
 
-    cat("God is alpha")
+    paste("God is alpha")
 
     ## declare all variables
     ctrl <- do.call(psp_control, as.list(control))
