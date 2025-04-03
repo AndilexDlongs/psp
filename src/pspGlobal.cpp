@@ -1,6 +1,7 @@
 // Copyright 2022 <Lenard Dome> [legal/copyright]
 // [[Rcpp::depends(RcppArmadillo)]]
 #include <RcppArmadillo.h>
+#include <chrono>
 #include <fstream>
 
 // [[Rcpp::depends(RcppArmadillo)]]
@@ -166,6 +167,8 @@ void WriteFile(int iteration, mat evaluation, vec matches,
 List pspGlobal(Function model, Function discretize, List control, bool save = false,
                std::string path = ".", std::string extension = ".csv", bool quiet = false) {
   // setup environment
+  auto start_total = std::chrono::high_resolution_clock::now();
+
   bool parameter_filled = false;
   int iteration = 0;
   uvec underpopulated = { 0 };
@@ -319,6 +322,11 @@ List pspGlobal(Function model, Function discretize, List control, bool save = fa
     Rcpp::Named("ordinal_patterns") = storage,
     Rcpp::Named("ordinal_counts") = counts,
     Rcpp::Named("iterations") = iteration);
+
+  auto end_total = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration_total = end_total - start_total;
+  Rcpp::Rcout << "[pspGlobal] Total time: " << duration_total.count() << " seconds\n";
+
 
   return(out);
 }
