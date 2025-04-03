@@ -167,8 +167,12 @@ void WriteFile(int iteration, mat evaluation, vec matches,
 List pspGlobal(Function model, Function discretize, List control, bool save = false,
                std::string path = ".", std::string extension = ".csv", bool quiet = false) {
   // setup environment
-  auto start_total = std::chrono::high_resolution_clock::now();
+  std::string log_file_path = path + "_pspGlobal_log.txt";
+  std::ofstream log_file(log_file_path, std::ios_base::app); // append mode
 
+  auto start_total = std::chrono::high_resolution_clock::now();
+  log_file << "[START] pspGlobal started\n";
+  
   bool parameter_filled = false;
   int iteration = 0;
   uvec underpopulated = { 0 };
