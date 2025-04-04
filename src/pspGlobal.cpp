@@ -1,5 +1,6 @@
 // Copyright 2022 <Lenard Dome> [legal/copyright]
 // [[Rcpp::depends(RcppArmadillo)]]
+#include <mpi.h>
 #include <RcppArmadillo.h>
 #include <chrono>
 #include <fstream>
@@ -164,173 +165,147 @@ void WriteFile(int iteration, mat evaluation, vec matches,
 }
 
 // [[Rcpp::export]]
-List pspGlobal(Function model, Function discretize, List control, bool save = false,
-               std::string path = ".", std::string extension = ".csv", bool quiet = false) {
-  // setup environment
-  std::string log_file_path = path + "_pspGlobal_log.txt";
-  std::ofstream log_file(log_file_path, std::ios_base::app); // append mode
+List pspGlobal(Function model, Function discretize, List control, bool save, std::string path, std::string extension, bool quiet) {
+  // Initialize MPI
+  MPI_Init(NULL, NULL);
+  int rank, size;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-  auto start_total = std::chrono::high_resolution_clock::now();
-  log_file << "[START] pspGlobal started\n";
-  
+  // Log start time (only on root process)
+  std::ofstream log_file;
+  if (rank == 0) {
+      std::string log_file_path = path + "_pspGlobal_log.txt";
+      log_file.open(log_file_path, std::ios_base::app);
+      auto start_total = std::chrono::high_resolution_clock::now();
+      log_file << "[START] pspGlobal started\n";
+  }
+
+  // Import thresholds from control
+  int max_iteration = as<int>(control["iterations"]);
+  int population = as<int>(control["population"]);
+  if (!max_iteration) max_iteration = std::numeric_limits<int>::max();
+  if (!population) population = std::numeric_limits<int>::max();
+  if (population == std::numeric_limits<int>::max() && max_iteration == std::numeric_limits<int>::max()) {
+      if (rank == 0) Rcpp::stop("A reasonable threshold must be set by either adjusting iteration or population.");
+      MPI_Finalize();
+      return List::create();
+  }
+
+  double radius = as<double>(control["radius"]);
+  mat init = as<mat>(control["init"]);
+  colvec lower = as<colvec>(control["lower"]);
+  colvec upper = as<colvec>(control["upper"]);
+  int dimensions = init.n_cols;
+  if (dimensions != lower.n_elem || dimensions != upper.n_elem) {
+      if (rank == 0) Rcpp::stop("init, lower, and upper must have the same length.");
+      MPI_Finalize();
+      return List::create();
+  }
+  int dimensionality = as<int>(control["dimensionality"]);
+  int response_length = as<int>(control["responses"]);
+
+  // Seed setup
+  Rcpp::Environment base_env("package:base");
+  Rcpp::Function set_seed_r = base_env["set.seed"];
+
+  // Prepare initial distributions and allocate arrays
+  mat last_eval = init;
+  mat jumping_distribution = init;
+  mat continuous(jumping_distribution.n_rows, response_length);
+  cube ordinal(dimensionality, dimensionality, jumping_distribution.n_rows);
+
   bool parameter_filled = false;
   int iteration = 0;
   uvec underpopulated = { 0 };
 
-  // import thresholds from control
-  int max_iteration = as<int>(control["iterations"]);
-  int population = as<int>(control["population"]);
-
-  if (!max_iteration) {
-    max_iteration = datum::inf;
-  }
-
-  if (!population) {
-    population =  datum::inf;
-  }
-
-  if (population == datum::inf && max_iteration == datum::inf) {
-    stop("A resonable threshold must be set by either adjusting iteration or population.");
-  }
-
-  double radius  = as<double>(control["radius"]);
-  mat init = as<mat>(control["init"]);
-
-  colvec lower = as<colvec>(control["lower"]);
-  colvec upper = as<colvec>(control["upper"]);
-  int dimensions = init.n_cols;
-  // do some basic error checks
-  if (dimensions != lower.n_elem || dimensions != upper.n_elem) {
-    stop("init, lower and upper must have the same length.");
-  }
-  int dimensionality = as<int>(control["dimensionality"]);
-  int response_length = as<int>(control["responses"]);
-  rowvec counts(1, fill::ones);  // keeps track of the population of ordinal regions
-  cube filtered; // stores all unique predictions
-  cube storage;  //  stores all unique ordinal patterns
-  CharacterVector parameter_names = as<CharacterVector>(control["parameter_names"]);
-  if (parameter_names.size() != dimensions) {
-    stop("Length of param_names must equal to the number of dimensions");
-  }
-  CharacterVector stimuli_names = as<CharacterVector>(control["stimuli_names"]);
-  List out;
-
-  // seed has to be set at the global R level
-  // see Documentation about the sampling
-  Rcpp::Environment base_env("package:base");
-  Rcpp::Function set_seed_r = base_env["set.seed"];
-
-  // evaluate first parameter sets
-  mat last_eval = init;
-  mat jumping_distribution = init;
-  mat continuous(jumping_distribution.n_rows, response_length);
-
-
-  // create first ordinal storage
-  cube ordinal(dimensionality, dimensionality, jumping_distribution.n_rows);
-
-
-  // evaluate jumping distributions
-  for (uword i = 0; i < jumping_distribution.n_rows; i++) {
-    NumericVector probabilities = model(jumping_distribution.row(i));
-    NumericMatrix teatime = discretize(probabilities);
-    const rowvec& responses = as<rowvec>(probabilities);
-    continuous.row(i) = responses;
-    const mat& evaluate = as<mat>(teatime);
-    ordinal.slice(i) = evaluate;
-  }
-
-  // compare ordinal patterns to stored ones and update list
-  uvec include = FindUniqueSlices(ordinal);
-
-  // update last evaluated parameters
-  last_eval = LastEvaluatedParameters(storage, ordinal.slices(include),
-                                      jumping_distribution.rows(include),
-                                      last_eval);
-
-  storage = OrdinalCompare(storage, ordinal.slices(include));
-  counts = CountOrdinal(storage, ordinal, counts);
-
-  ////////////////////////////////////////////////////////////////
-
-  if (save) {
-    vec match = MatchJumpDists(storage, ordinal);
-    CreateFile(parameter_names, path + "_parameters" + extension);
-    CreateFile(stimuli_names, path + "_continuous" + extension);
-    WriteFile(0, jumping_distribution, match, path + "_parameters" + extension);
-    WriteFile(0, continuous, match, path + "_continuous" + extension);
-  }
-
-  // run parameter space partitioning until parameter is filled
+  // Iterate until the parameter space is filled or max iterations are reached
   while (!parameter_filled) {
-    // update iteration
-    iteration += 1;
+      iteration++;
 
-    if (!quiet) {
-      Rprintf("Iteration: [%i]\n", iteration);
-    }
+      // Divide work for MPI processes
+      int num_points = init.n_rows;
+      int points_per_process = num_points / size;
+      int remainder = num_points % size;
+      int start_index = rank * points_per_process + std::min(rank, remainder);
+      int end_index = start_index + points_per_process + (rank < remainder ? 1 : 0);
 
-    // reset the seed
-    int pool =  as<int>(Rcpp::sample(10000000, 1));
-    set_seed_r(pool); 
+      // Evaluate jumping distributions for each MPI process
+      for (int i = start_index; i < end_index; i++) {
+          NumericVector probabilities = model(jumping_distribution.row(i));
+          NumericMatrix teatime = discretize(probabilities);
+          rowvec responses = as<rowvec>(probabilities);
+          continuous.row(i) = responses;
+          mat evaluate = as<mat>(teatime);
+          ordinal.slice(i) = evaluate;
+      }
 
-    // generate new jumping distributions from ordinal patterns with counts < population
-    mat jumping_distribution = HyperPoints(underpopulated.n_elem,
-                                           dimensions, radius);
-    jumping_distribution = jumping_distribution + last_eval.rows(underpopulated);
-    jumping_distribution = ClampParameters(jumping_distribution, lower, upper);
-    // allocate cube for ordinal predictions
-    ordinal.resize(dimensionality, dimensionality, jumping_distribution.n_rows);
-    continuous.resize(jumping_distribution.n_rows, response_length);
+      // Gather results from all processes to root process
+      if (rank == 0) {
+          mat all_continuous(num_points, response_length);
+          cube all_ordinal(dimensionality, dimensionality, num_points);
 
-    // evaluate jumping distributions
-    for (uword i = 0; i < jumping_distribution.n_rows; i++) {
-      NumericVector probabilities = model(jumping_distribution.row(i));
-      NumericMatrix teatime = discretize(probabilities);
-      const rowvec& responses = as<rowvec>(probabilities);
-      continuous.row(i) = responses;
-      const mat& evaluate = as<mat>(teatime);
-      ordinal.slice(i) = evaluate;
-    }
+          std::vector<int> recvcounts(size);
+          std::vector<int> displs(size);
+          for (int i = 0; i < size; i++) {
+              recvcounts[i] = (num_points / size) + (i < remainder ? 1 : 0);
+              displs[i] = (i == 0) ? 0 : displs[i - 1] + recvcounts[i - 1];
+          }
 
-    // compare ordinal patterns to stored ones and update list
-    uvec include = FindUniqueSlices(ordinal);
+          MPI_Gatherv(continuous.memptr() + start_index * response_length, (end_index - start_index) * response_length, MPI_DOUBLE,
+                      all_continuous.memptr(), recvcounts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // update last evaluated parameters
-    last_eval = LastEvaluatedParameters(storage, ordinal.slices(include),
-                                        jumping_distribution.rows(include),
-                                        last_eval);
+          // Process the gathered results on root
+          uvec include = FindUniqueSlices(all_ordinal); // Assuming this function is defined elsewhere
+          last_eval = LastEvaluatedParameters(storage, all_ordinal.slices(include),
+                                              jumping_distribution.rows(include), last_eval); // Assuming this function is defined elsewhere
+          storage = OrdinalCompare(storage, all_ordinal.slices(include)); // Assuming this function is defined elsewhere
+          counts = CountOrdinal(storage, all_ordinal, counts); // Assuming this function is defined elsewhere
 
-    storage = OrdinalCompare(storage, ordinal.slices(include));
+          underpopulated = find(counts < population);
 
-    // update counts of ordinal patterns
-    counts = CountOrdinal(storage, ordinal, counts);
-    underpopulated = find( counts < population );
+          // Check termination condition
+          if (iteration == max_iteration || underpopulated.n_elem == 0) {
+              parameter_filled = true;
+          }
+      }
 
-    // write data to disk
-    if (save) {
-      // index locations of currently found patterns in storage
-      vec match = MatchJumpDists(storage, ordinal);
-      WriteFile(iteration, jumping_distribution, match, path + "_parameters" + extension);
-      WriteFile(iteration, continuous, match, path + "_continuous" + extension);
-    }
+      // Broadcast termination condition to all processes
+      MPI_Bcast(&parameter_filled, 1, MPI_CXX_BOOL, 0, MPI_COMM_WORLD);
+      if (parameter_filled) break;
 
-    // check if either of the parameter_filled thresholds is reached
-    if (iteration == max_iteration || underpopulated.n_elem == 0) {
-      parameter_filled = TRUE;
-    }
+      // Optional: Write data to disk
+      if (save && rank == 0) {
+          vec match = MatchJumpDists(storage, ordinal); // Assuming this function is defined elsewhere
+          WriteFile(iteration, jumping_distribution, match, path + "_parameters" + extension); // Assuming this function is defined elsewhere
+          WriteFile(iteration, continuous, match, path + "_continuous" + extension); // Assuming this function is defined elsewhere
+      }
+
+      // Logging iteration time
+      if (rank == 0) {
+          log_file << "[ITERATION] " << iteration << " completed.\n";
+      }
   }
 
-  // compile output including ordinal patterns and their frequencies
-  out = Rcpp::List::create(
-    Rcpp::Named("ordinal_patterns") = storage,
-    Rcpp::Named("ordinal_counts") = counts,
-    Rcpp::Named("iterations") = iteration);
+  // Log total time
+  if (rank == 0) {
+      auto end_total = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double> duration_total = end_total - start_total;
+      log_file << "[END] pspGlobal completed in " << duration_total.count() << " seconds\n";
+      log_file.close();
+  }
 
-  auto end_total = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> duration_total = end_total - start_total;
-  Rcpp::Rcout << "[pspGlobal] Total time: " << duration_total.count() << " seconds\n";
+  // Finalize MPI
+  MPI_Finalize();
 
-
-  return(out);
+  // Return results from rank 0
+  if (rank == 0) {
+      List out = Rcpp::List::create(
+          Rcpp::Named("ordinal_patterns") = storage,
+          Rcpp::Named("ordinal_counts") = counts,
+          Rcpp::Named("iterations") = iteration
+      );
+      return out;
+  }
+  return List::create();
 }
